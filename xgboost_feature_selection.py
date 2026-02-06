@@ -150,3 +150,166 @@ print(f"相对增益>{gain_threshold}特征 | AUC：{auc_thresh:.4f}，KS：{ks_
 # 9. 输出最终筛选后的特征（可选择任意一种方式的结果）
 final_selected_features = selected_features_topn  # 选择前N名的结果，可替换为selected_features_thresh
 print(f"\n最终筛选后的特征列表：{final_selected_features}")
+
+
+#%%
+
+# 1. Import core libraries
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import xgboost as xgb
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import roc_auc_score
+import warnings
+warnings.filterwarnings('ignore')  # Ignore irrelevant warnings
+
+# Set visualization style for clarity
+plt.rcParams['font.sans-serif'] = ['SimHei']  # Fix Chinese display issue
+plt.rcParams['axes.unicode_minus'] = False
+
+# 2. Define KS calculation function (core evaluation metric for risk control modeling, more relevant than AUC)
+def calculate_ks(y_true, y_pred, n_bins=10):
+    """
+    Calculate KS value
+    :param y_true: True labels
+    :param y_pred: Predicted probabilities
+    :param n_bins: Number of bins for stratification
+    :return: KS value, KS-related bin statistics
+    """
+    df = pd.DataFrame({'y_true': y_true, 'y_pred': y_pred})
+    # Equal-frequency binning
+    df['bin'] = pd.qcut(df['y_pred'], n_bins, duplicates='drop')
+    # Statistics by bin
+    bin_stats = df.groupby('bin')['y_true'].agg(['count', 'sum']).reset_index()
+    bin_stats.columns = ['bin', 'total', 'bad']
+    bin_stats['good'] = bin_stats['total'] - bin_stats['bad']
+    # Calculate cumulative bad rate and cumulative good rate
+    bin_stats['cum_bad'] = bin_stats['bad'].cumsum() / bin_stats['bad'].sum()
+    bin_stats['cum_good'] = bin_stats['good'].cumsum() / bin_stats['good'].sum()
+    # Calculate KS for each bin
+    bin_stats['ks'] = abs(bin_stats['cum_bad'] - bin_stats['cum_good'])
+    ks_value = bin_stats['ks'].max()
+    return ks_value, bin_stats
+
+# 3. Load and preprocess data (demonstration using credit card fraud dataset; replace with your business data)
+# Dataset description: Features V1-V28 are preprocessed continuous features, Amount is transaction amount, 
+# Class is label (0=normal, 1=fraud; imbalanced data)
+data = pd.read_csv('https://www.kaggle.com/mlg-ulb/creditcardfraud/download?datasetVersionNumber=1')
+
+# Simple preprocessing (XGBoost tolerates minor missing values; only standardize Amount here to adapt to imbalanced data)
+scaler = StandardScaler()
+data['Amount'] = scaler.fit_transform(data['Amount'].values.reshape(-1, 1))
+data = data.drop('Time', axis=1)  # Remove irrelevant Time feature
+
+# Split features and labels
+X = data.drop('Class', axis=1)
+y = data['Class']
+feature_names = X.columns.tolist()  # Save original feature names
+
+# Key step: Split into training/test sets - only use training set for feature selection; test set for validation
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.3, random_state=42, stratify=y  # Stratified sampling to maintain label distribution
+)
+print(f"Number of original features: {len(feature_names)}")
+print(f"Training set size: {X_train.shape[0]}, Test set size: {X_test.shape[0]}")
+
+# 4. Define and train XGBoost model (binary classification; general parameters for risk control/classification)
+xgb_model = xgb.XGBClassifier(
+    objective='binary:logistic',  # Binary classification objective function
+    eval_metric='auc',            # Evaluation metric: AUC
+    learning_rate=0.1,            # Learning rate
+    max_depth=5,                  # Tree depth
+    n_estimators=100,             # Number of trees
+    subsample=0.8,                # Sample proportion for training
+    colsample_bytree=0.8,         # Feature proportion per tree
+    random_state=42,
+    scale_pos_weight=len(y_train[y_train==0])/len(y_train[y_train==1])  # Weight for positive samples (imbalanced data)
+)
+# Train model (using only training set)
+xgb_model.fit(X_train, y_train)
+
+# 5. Extract XGBoost feature importance (Core: Gain - far superior to default Weight)
+# Method: Get native model via get_booster(), extract importance with type 'gain'
+feature_importance = xgb_model.get_booster().get_score(
+    importance_type='gain'  # Options: gain (feature contribution), weight (split count), cover (sample coverage)
+)
+# Convert to DataFrame for sorting and selection
+fi_df = pd.DataFrame({
+    'feature': list(feature_importance.keys()),
+    'gain': list(feature_importance.values())
+})
+# Sort by gain in descending order
+fi_df = fi_df.sort_values(by='gain', ascending=False).reset_index(drop=True)
+# Calculate relative gain (proportion of total gain for easier threshold setting)
+fi_df['relative_gain'] = fi_df['gain'] / fi_df['gain'].sum()
+
+print("\nTop 10 high-importance features (sorted by Gain):")
+print(fi_df.head(10))
+
+# 6. Feature importance visualization (horizontal bar chart for intuition)
+plt.figure(figsize=(12, 8))
+# Plot top 20 features to avoid overcrowding
+top_n_vis = 20
+sns_data = fi_df.head(top_n_vis)
+plt.barh(range(len(sns_data)), sns_data['gain'], color='#1f77b4')
+plt.yticks(range(len(sns_data)), sns_data['feature'])
+plt.xlabel('XGBoost Gain (Feature Contribution)')
+plt.ylabel('Feature Name')
+plt.title(f'XGBoost Feature Importance TOP{top_n_vis} (Sorted by Gain)')
+plt.gca().invert_yaxis()  # Invert y-axis to show top features first
+plt.tight_layout()
+plt.show()
+
+# 7. XGBoost feature selection (two common methods; choose one or combine)
+## Method 1: Select top N features (Recommended for scenarios with clear desired feature count, e.g., 10-20 for risk control)
+select_top_n = 15  # Customize: retain top 15 features with highest Gain
+selected_features_topn = fi_df.head(select_top_n)['feature'].tolist()
+
+## Method 2: Select by relative gain threshold (Suitable for selecting by predictive power, e.g., retain features with relative_gain > 0.01)
+gain_threshold = 0.01  # Customize: relative gain threshold (adjust based on business needs)
+selected_features_thresh = fi_df[fi_df['relative_gain'] > gain_threshold]['feature'].tolist()
+
+# Print selection results
+print(f"\nMethod 1 - Top {select_top_n} features: {len(selected_features_topn)} features retained")
+print(f"Selected features: {selected_features_topn}")
+print(f"\nMethod 2 - Features with relative_gain > {gain_threshold}: {len(selected_features_thresh)} features retained")
+print(f"Selected features: {selected_features_thresh}")
+
+# 8. Validate model performance after selection (compare with original features to ensure no significant degradation)
+def evaluate_model(X_tr, X_te, y_tr, y_te, features, model):
+    """
+    Evaluate model performance (AUC + KS)
+    :param features: List of features to evaluate
+    :return: AUC score, KS score
+    """
+    # Train model with specified features
+    model.fit(X_tr[features], y_tr)
+    # Predict probabilities on test set
+    y_pred = model.predict_proba(X_te[features])[:, 1]
+    # Calculate AUC and KS
+    auc = roc_auc_score(y_te, y_pred)
+    ks, _ = calculate_ks(y_te, y_pred)
+    return auc, ks
+
+# Evaluate performance with original features
+auc_original, ks_original = evaluate_model(X_train, X_test, y_train, y_test, feature_names, xgb_model)
+# Evaluate performance with top N features (Method 1)
+auc_topn, ks_topn = evaluate_model(X_train, X_test, y_train, y_test, selected_features_topn, xgb_model)
+# Evaluate performance with threshold-based features (Method 2)
+auc_thresh, ks_thresh = evaluate_model(X_train, X_test, y_train, y_test, selected_features_thresh, xgb_model)
+
+# Print performance comparison
+print("\n========== Model Performance Comparison Before and After Selection (Test Set) ==========")
+print(f"Original features | AUC: {auc_original:.4f}, KS: {ks_original:.4f}")
+print(f"Top {select_top_n} features | AUC: {auc_topn:.4f}, KS: {ks_topn:.4f}")
+print(f"Features with relative_gain > {gain_threshold} | AUC: {auc_thresh:.4f}, KS: {ks_thresh:.4f}")
+
+# 9. Output final selected features (choose result from either method)
+final_selected_features = selected_features_topn  # Use top N features; replace with selected_features_thresh if needed
+print(f"\nFinal selected features: {final_selected_features}")
+
+
+#%%
+
